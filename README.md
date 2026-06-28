@@ -29,36 +29,45 @@ Synthetic data is generated in Python and batch-loaded into Supabase Postgres. `
 
 Generated with a deliberately realistic shape rather than uniform random data:
 
-- **3,000 users** across 15 countries and 3 device types
-- **~109,000 sessions** over a 6-month window
-- **~476,000 widget events** (impressions, interactions, completions)
+- **10,000 users** across 15 countries, 3 device types, and 5 acquisition channels
+- **~320,000 sessions** over a 12-month window
+- **~2.0M widget events** (impressions, interactions, completions)
 - **Power-law engagement**: the top 20% of users drive ~78% of all sessions — modeled with a Pareto-weighted distribution, not `random.randint()`
+- **Channel-quality-weighted engagement**: organic/referral users engage ~15% above the power-law baseline; paid_social/influencer users ~35–45% below it — acquisition channel isn't just a label, it actually drives different behavior in the data
 - **Front-loaded signups**: a launch spike that tapers over time, so retention cohorts have realistic maturity differences
+- **3 pre-seeded A/B experiments** with deterministic hash-based variant assignment across all 10,000 users
+
+See [`data_dictionary.md`](data_dictionary.md) for the full table/column reference.
 
 ---
 
 ## Schema
 
-Seven tables: a central `widget_events` fact table surrounded by dimension and rollup tables.
+Nine tables: a central `widget_events` fact table surrounded by dimension, rollup, and experimentation tables. Full column-level reference in [`data_dictionary.md`](data_dictionary.md).
 
 ```
-users (user_id PK, signup_date, country, device_type)
+users (user_id PK, signup_date, country, device_type, user_segment, acquisition_channel)
   │
   ├──< sessions (session_id PK, user_id FK, app_open_time, app_close_time, platform)
   │       │
   │       └──< widget_events (event_id PK, widget_id FK, user_id FK, session_id FK,
-  │                            event_type, event_timestamp, points_earned)
+  │                            event_type, event_timestamp, points_earned, properties JSONB)
   │                  │
-widgets (widget_id PK, widget_type, name, sport, launch_date) >──┘
+  ├── widgets (widget_id PK, widget_type, name, sport, launch_date) >──┘
   │
-user_points (user_id PK/FK, total_points, current_rank, last_updated)
-  │
-badges (badge_id PK, user_id FK, badge_name, earned_date)
+  ├── user_points (user_id PK/FK, total_points, current_rank, last_updated)
+  ├── badges (badge_id PK, user_id FK, badge_name, earned_date)
+  └──< experiment_assignments (user_id FK, experiment_id FK, variant, assigned_at) >── experiments
+                                                                       (experiment_id PK, experiment_name,
+                                                                        hypothesis, metric, start_date,
+                                                                        end_date, status)
 ```
 
 - `widget_type` ∈ {poll, trivia, prediction, leaderboard}
 - `event_type` ∈ {impression, interaction, completion}
-- All foreign keys enforced with `ON DELETE CASCADE`; indexes on FK columns and frequently-filtered columns (`event_timestamp`, `event_type`, `user_id`).
+- `user_segment` ∈ {free, premium, churned} — derived post-hoc from actual session/points behavior, not assigned at signup
+- `acquisition_channel` ∈ {organic, paid_social, referral, influencer, app_store_search}
+- All foreign keys enforced with `ON DELETE CASCADE`; indexes on FK columns and frequently-filtered columns (`event_timestamp`, `event_type`, `user_id`, `user_segment`, `acquisition_channel`).
 
 ---
 
@@ -180,6 +189,7 @@ This project batch-computes `user_points` from `widget_events` in `generate_data
 | File | Purpose |
 |---|---|
 | `schema.sql` | Table definitions, constraints, indexes |
+| `data_dictionary.md` | Full table/column reference with business definitions |
 | `generate_data.py` | Synthetic data generation and batch loading |
 | `verify_data.py` | Data validation (row counts, orphan checks, distributions) |
 | `queries.sql` | The 8-query analysis layer, fully commented |

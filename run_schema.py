@@ -13,7 +13,7 @@ with open("schema.sql", "r") as f:
 
 cur.execute(sql)
 
-print("✅ Schema created successfully")
+print("Schema created successfully")
 
 cur.close()
 conn.close()

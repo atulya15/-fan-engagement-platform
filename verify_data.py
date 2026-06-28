@@ -30,7 +30,9 @@ run("Row counts", """
     UNION ALL SELECT 'widgets', COUNT(*) FROM widgets
     UNION ALL SELECT 'widget_events', COUNT(*) FROM widget_events
     UNION ALL SELECT 'user_points', COUNT(*) FROM user_points
-    UNION ALL SELECT 'badges', COUNT(*) FROM badges;
+    UNION ALL SELECT 'badges', COUNT(*) FROM badges
+    UNION ALL SELECT 'experiments', COUNT(*) FROM experiments
+    UNION ALL SELECT 'experiment_assignments', COUNT(*) FROM experiment_assignments;
 """)
 
 # 2. Orphaned foreign keys (should all return 0)
@@ -129,6 +131,43 @@ run("Date range checks", """
         MIN(signup_date) AS earliest_signup,
         MAX(signup_date) AS latest_signup
     FROM users;
+""")
+
+# 8. Segment distribution
+run("User segment distribution", """
+    SELECT user_segment, COUNT(*), ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct
+    FROM users
+    GROUP BY user_segment
+    ORDER BY user_segment;
+""")
+
+# 9. Acquisition channel distribution + average engagement (sanity check
+#    that quality multipliers actually produced the intended skew)
+run("Acquisition channel: signups vs avg sessions per user", """
+    SELECT
+        u.acquisition_channel,
+        COUNT(DISTINCT u.user_id) AS num_users,
+        ROUND(COUNT(s.session_id)::numeric / COUNT(DISTINCT u.user_id), 1) AS avg_sessions_per_user
+    FROM users u
+    LEFT JOIN sessions s ON s.user_id = u.user_id
+    GROUP BY u.acquisition_channel
+    ORDER BY avg_sessions_per_user DESC;
+""")
+
+# 10. Experiment assignment balance
+run("Experiment assignment counts by variant", """
+    SELECT e.experiment_name, ea.variant, COUNT(*) AS num_users
+    FROM experiment_assignments ea
+    JOIN experiments e ON e.experiment_id = ea.experiment_id
+    GROUP BY e.experiment_name, ea.variant
+    ORDER BY e.experiment_name, ea.variant;
+""")
+
+# 11. Orphaned experiment_assignments (should be 0)
+run("Orphaned experiment_assignments (user_id not in users)", """
+    SELECT COUNT(*) FROM experiment_assignments ea
+    LEFT JOIN users u ON ea.user_id = u.user_id
+    WHERE u.user_id IS NULL;
 """)
 
 cur.close()

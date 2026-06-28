@@ -5,6 +5,8 @@
 -- ============================================================
 
 -- Drop tables if rerunning (order matters due to FK constraints)
+DROP TABLE IF EXISTS experiment_assignments CASCADE;
+DROP TABLE IF EXISTS experiments CASCADE;
 DROP TABLE IF EXISTS badges CASCADE;
 DROP TABLE IF EXISTS user_points CASCADE;
 DROP TABLE IF EXISTS widget_events CASCADE;
@@ -16,10 +18,13 @@ DROP TABLE IF EXISTS users CASCADE;
 -- users: core fan accounts
 -- ============================================================
 CREATE TABLE users (
-    user_id       SERIAL PRIMARY KEY,
-    signup_date   TIMESTAMPTZ NOT NULL,
-    country       VARCHAR(100) NOT NULL,
-    device_type   VARCHAR(20) NOT NULL CHECK (device_type IN ('iOS', 'Android', 'Web'))
+    user_id              SERIAL PRIMARY KEY,
+    signup_date          TIMESTAMPTZ NOT NULL,
+    country              VARCHAR(100) NOT NULL,
+    device_type          VARCHAR(20) NOT NULL CHECK (device_type IN ('iOS', 'Android', 'Web')),
+    user_segment         VARCHAR(20) NOT NULL DEFAULT 'free' CHECK (user_segment IN ('free', 'premium', 'churned')),
+    acquisition_channel  VARCHAR(30) NOT NULL DEFAULT 'organic'
+        CHECK (acquisition_channel IN ('organic', 'paid_social', 'referral', 'influencer', 'app_store_search'))
 );
 
 -- ============================================================
@@ -56,7 +61,11 @@ CREATE TABLE widget_events (
     session_id        INTEGER NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     event_type        VARCHAR(20) NOT NULL CHECK (event_type IN ('impression', 'interaction', 'completion')),
     event_timestamp   TIMESTAMPTZ NOT NULL,
-    points_earned     INTEGER NOT NULL DEFAULT 0 CHECK (points_earned >= 0)
+    points_earned     INTEGER NOT NULL DEFAULT 0 CHECK (points_earned >= 0),
+    properties        JSONB NOT NULL DEFAULT '{}'::jsonb
+    -- Flexible per-event metadata (e.g. {"poll_choice": "B"}, {"predicted_score": 3}).
+    -- Mirrors the Amplitude/Mixpanel "properties bag" pattern so new widget
+    -- types or experiment variants can attach data without a schema migration.
 );
 
 -- ============================================================
@@ -80,6 +89,31 @@ CREATE TABLE badges (
 );
 
 -- ============================================================
+-- experiments: A/B test definitions
+-- ============================================================
+CREATE TABLE experiments (
+    experiment_id     SERIAL PRIMARY KEY,
+    experiment_name   VARCHAR(150) NOT NULL,
+    hypothesis        TEXT NOT NULL,
+    metric            VARCHAR(100) NOT NULL,
+    start_date        TIMESTAMPTZ NOT NULL,
+    end_date          TIMESTAMPTZ,
+    status            VARCHAR(20) NOT NULL DEFAULT 'planned'
+        CHECK (status IN ('planned', 'running', 'completed', 'shipped', 'rolled_back'))
+);
+
+-- ============================================================
+-- experiment_assignments: which variant each user is bucketed into
+-- ============================================================
+CREATE TABLE experiment_assignments (
+    user_id          INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    experiment_id    INTEGER NOT NULL REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+    variant          VARCHAR(30) NOT NULL,
+    assigned_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (user_id, experiment_id)
+);
+
+-- ============================================================
 -- Indexes — these matter once widget_events has hundreds of
 -- thousands of rows and we start running DAU/WAU/retention queries
 -- ============================================================
@@ -93,3 +127,9 @@ CREATE INDEX idx_widget_events_timestamp ON widget_events(event_timestamp);
 CREATE INDEX idx_widget_events_type ON widget_events(event_type);
 
 CREATE INDEX idx_badges_user_id ON badges(user_id);
+
+CREATE INDEX idx_users_segment ON users(user_segment);
+CREATE INDEX idx_users_acquisition_channel ON users(acquisition_channel);
+
+CREATE INDEX idx_experiment_assignments_experiment_id ON experiment_assignments(experiment_id);
+CREATE INDEX idx_experiment_assignments_user_id ON experiment_assignments(user_id);

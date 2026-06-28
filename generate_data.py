@@ -35,9 +35,10 @@ import os
 import random
 from datetime import datetime, timedelta, timezone
 
+import hashlib
 import numpy as np
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import execute_values, Json
 from dotenv import load_dotenv
 from faker import Faker
 
@@ -46,8 +47,8 @@ from faker import Faker
 # ============================================================
 load_dotenv()
 
-N_USERS = 3000
-SIM_MONTHS = 6
+N_USERS = 10000
+SIM_MONTHS = 12
 SIM_DAYS = SIM_MONTHS * 30
 SIM_END = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 SIM_START = SIM_END - timedelta(days=SIM_DAYS)
@@ -70,9 +71,31 @@ COUNTRY_WEIGHTS = [0.22, 0.10, 0.14, 0.08, 0.06, 0.05, 0.04, 0.05,
 DEVICE_TYPES = ["iOS", "Android", "Web"]
 DEVICE_WEIGHTS = [0.45, 0.42, 0.13]
 
+# Acquisition channels and their relative share of signups. Quality
+# multipliers scale each user's engagement weight (session count target):
+# organic/referral users tend to have higher intent (they sought the
+# product out or were vouched for by a friend); paid_social/influencer
+# users are lower-intent "spray and pray" acquisition, so they engage
+# less per-capita even though they may be cheap to acquire in volume.
+ACQUISITION_CHANNELS = ["organic", "paid_social", "referral", "influencer", "app_store_search"]
+ACQUISITION_WEIGHTS = [0.40, 0.20, 0.15, 0.15, 0.10]
+CHANNEL_QUALITY_MULTIPLIER = {
+    "organic": 1.00,
+    "referral": 1.15,
+    "app_store_search": 1.05,
+    "paid_social": 0.65,
+    "influencer": 0.55,
+}
+
+# A user with no session in the trailing window is considered churned.
+CHURN_WINDOW_DAYS = 45
+# Among non-churned users, only the top points percentile converts to premium.
+PREMIUM_POINTS_PERCENTILE = 0.75
+PREMIUM_CONVERSION_PROB = 0.70
+
 SPORTS = ["Football", "Basketball", "Cricket", "Soccer", "Baseball", "Tennis"]
 WIDGET_TYPES = ["poll", "trivia", "prediction", "leaderboard"]
-N_WIDGETS = 40  # spread across sports/types over the 6-month window
+N_WIDGETS = 60  # spread across sports/types over the 12-month window
 
 # Conversion rates differ slightly by widget_type — polls are one-tap,
 # trivia/prediction require more thought, leaderboard is mostly passive viewing.
@@ -84,6 +107,19 @@ WIDGET_CONVERSION = {
 }
 
 POINTS_MAP = {"impression": 0, "interaction": 1, "completion": 5}
+
+
+def widget_interaction_properties(widget_type: str) -> dict:
+    """Free-form metadata attached to an 'interaction' event, varying by
+    widget_type — the kind of thing a real event-properties bag holds
+    (e.g. which poll option a user tapped, what score they predicted)."""
+    if widget_type == "poll":
+        return {"choice": random.choice(["A", "B", "C"])}
+    if widget_type == "trivia":
+        return {"answer_correct": random.random() < 0.6}
+    if widget_type == "prediction":
+        return {"predicted_score": random.randint(0, 5)}
+    return {}
 
 DB_URL = os.environ["DATABASE_URL"]
 
@@ -157,8 +193,9 @@ def generate_users(n_users: int):
     signup_dates = generate_signup_dates(n_users)
     countries = RNG.choice(COUNTRIES, size=n_users, p=COUNTRY_WEIGHTS)
     devices = RNG.choice(DEVICE_TYPES, size=n_users, p=DEVICE_WEIGHTS)
+    channels = RNG.choice(ACQUISITION_CHANNELS, size=n_users, p=ACQUISITION_WEIGHTS)
     return [
-        (signup_dates[i], countries[i], devices[i])
+        (signup_dates[i], countries[i], devices[i], channels[i])
         for i in range(n_users)
     ]
 
@@ -166,18 +203,27 @@ def generate_users(n_users: int):
 # ============================================================
 # STEP 2: ENGAGEMENT WEIGHT (power-law) PER USER
 # ============================================================
-def generate_engagement_weights(n_users: int) -> np.ndarray:
+def generate_engagement_weights(n_users: int, channels: np.ndarray) -> np.ndarray:
     """
     Returns a session-count target per user following a power-law-like
     curve: ~20% of users generate ~78% of total sessions.
     Calibrated via rank-transform of a Pareto draw, validated to hit
     realistic 80/20-ish engagement skew (see project notes / README).
+
+    The base power-law curve is then scaled per-user by their
+    acquisition channel's quality multiplier, so organic/referral users
+    skew toward higher engagement than paid_social/influencer users —
+    without breaking the underlying power-law shape.
     """
     weights = RNG.pareto(1.5, n_users) + 1
     ranks = (np.argsort(np.argsort(weights)) + 0.5) / n_users  # uniform 0..1
     exponent = 6
     min_sessions, max_sessions = 1, 250
     counts = (ranks ** exponent) * (max_sessions - min_sessions) + min_sessions
+
+    multipliers = np.array([CHANNEL_QUALITY_MULTIPLIER[c] for c in channels])
+    counts = counts * multipliers
+
     return np.clip(counts.astype(int), min_sessions, max_sessions)
 
 
@@ -208,13 +254,14 @@ def generate_sessions_and_events(users_with_ids, widgets_with_ids):
     sessions = []
     event_rows = []
 
-    engagement_weights = generate_engagement_weights(len(users_with_ids))
+    channels = np.array([u[2] for u in users_with_ids])
+    engagement_weights = generate_engagement_weights(len(users_with_ids), channels)
     widget_launch = {w[0]: w[4] for w in widgets_with_ids}
     widget_type_map = {w[0]: w[1] for w in widgets_with_ids}
 
     session_id_counter = 1
 
-    for idx, (user_id, signup_date) in enumerate(users_with_ids):
+    for idx, (user_id, signup_date, _channel) in enumerate(users_with_ids):
         n_sessions = int(engagement_weights[idx])
 
         active_days = max((SIM_END - signup_date).days, 1)
@@ -239,7 +286,7 @@ def generate_sessions_and_events(users_with_ids, widgets_with_ids):
                 session_id_counter += 1
                 continue
 
-            n_impressions = min(len(live_widgets), int(RNG.poisson(2)) + 1)
+            n_impressions = min(len(live_widgets), int(RNG.poisson(3)) + 1)
             chosen_widgets = random.sample(live_widgets, n_impressions)
 
             for widget_id in chosen_widgets:
@@ -250,7 +297,7 @@ def generate_sessions_and_events(users_with_ids, widgets_with_ids):
                     seconds=random.randint(0, max(duration_min * 60 - 1, 1))
                 )
                 event_rows.append((widget_id, user_id, session_id_counter,
-                                    "impression", impression_ts, POINTS_MAP["impression"]))
+                                    "impression", impression_ts, POINTS_MAP["impression"], {}))
 
                 if random.random() < conv["impression_to_interaction"]:
                     interaction_ts = min(
@@ -258,7 +305,8 @@ def generate_sessions_and_events(users_with_ids, widgets_with_ids):
                         close_time,
                     )
                     event_rows.append((widget_id, user_id, session_id_counter,
-                                        "interaction", interaction_ts, POINTS_MAP["interaction"]))
+                                        "interaction", interaction_ts, POINTS_MAP["interaction"],
+                                        widget_interaction_properties(w_type)))
 
                     if random.random() < conv["interaction_to_completion"]:
                         completion_ts = min(
@@ -266,7 +314,7 @@ def generate_sessions_and_events(users_with_ids, widgets_with_ids):
                             close_time,
                         )
                         event_rows.append((widget_id, user_id, session_id_counter,
-                                            "completion", completion_ts, POINTS_MAP["completion"]))
+                                            "completion", completion_ts, POINTS_MAP["completion"], {}))
 
             session_id_counter += 1
 
@@ -280,7 +328,7 @@ def generate_user_points(user_ids, event_rows):
     """Aggregate points per user and assign standard competition rank
     (ties share a rank, e.g. 1,2,2,4 — matches SQL RANK() semantics)."""
     totals = {uid: 0 for uid in user_ids}
-    for (_, user_id, _, _, _, points) in event_rows:
+    for (_, user_id, _, _, _, points, _properties) in event_rows:
         totals[user_id] += points
 
     ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
@@ -315,6 +363,110 @@ def generate_badges(user_points_rows):
 
 
 # ============================================================
+# STEP 7: USER_SEGMENT (churned / premium / free, computed post-hoc)
+# ============================================================
+def generate_user_segments(user_ids, sessions, user_points_rows):
+    """
+    Segment is derived from actual simulated behavior, not assigned
+    up front, since "is this user premium/churned" is a function of
+    what they did, not who they are at signup:
+      - churned: no session in the trailing CHURN_WINDOW_DAYS of the
+        simulation window (a user who never had a session at all also
+        counts as churned).
+      - premium: not churned, AND in the top points percentile, AND
+        clears a random conversion check (not every highly-engaged
+        user pays — this avoids a deterministic points-to-premium cliff).
+      - free: everyone else.
+    """
+    last_session = {}
+    for (_, user_id, open_time, _close, _platform) in sessions:
+        if user_id not in last_session or open_time > last_session[user_id]:
+            last_session[user_id] = open_time
+
+    points_by_user = {uid: pts for (uid, pts, _rank, _ts) in user_points_rows}
+    points_values = sorted(points_by_user.values())
+    if points_values:
+        cutoff_idx = int(len(points_values) * PREMIUM_POINTS_PERCENTILE)
+        cutoff_idx = min(cutoff_idx, len(points_values) - 1)
+        premium_points_cutoff = points_values[cutoff_idx]
+    else:
+        premium_points_cutoff = 0
+
+    churn_cutoff = SIM_END - timedelta(days=CHURN_WINDOW_DAYS)
+
+    rows = []
+    for uid in user_ids:
+        last_seen = last_session.get(uid)
+        is_churned = last_seen is None or last_seen < churn_cutoff
+        if is_churned:
+            segment = "churned"
+        elif points_by_user.get(uid, 0) >= premium_points_cutoff and random.random() < PREMIUM_CONVERSION_PROB:
+            segment = "premium"
+        else:
+            segment = "free"
+        rows.append((uid, segment))
+    return rows
+
+
+# ============================================================
+# STEP 8: EXPERIMENTS (pre-built A/B tests, baked into generation
+# so Phase 4's experimentation engine has ready-made data)
+# ============================================================
+EXPERIMENTS = [
+    {
+        "name": "Personalized Feed vs Chronological",
+        "hypothesis": "A personalized content/widget feed increases Day-7 retention vs a chronological feed.",
+        "metric": "day_7_retention",
+        "variants": ["control", "treatment"],
+        "variant_weights": [0.5, 0.5],
+    },
+    {
+        "name": "Onboarding Steps Reduction",
+        "hypothesis": "Reducing onboarding from 5 steps to 2 steps increases signup-to-first-engagement conversion.",
+        "metric": "signup_to_first_engagement_conversion",
+        "variants": ["control", "treatment"],
+        "variant_weights": [0.5, 0.5],
+    },
+    {
+        "name": "Push Notification Timing",
+        "hypothesis": "ML-optimized push notification timing increases session frequency vs fixed morning/evening sends.",
+        "metric": "session_frequency",
+        "variants": ["morning", "evening", "ml_optimized"],
+        "variant_weights": [1 / 3, 1 / 3, 1 / 3],
+    },
+]
+
+
+def generate_experiment_assignments(user_ids, experiment_rows):
+    """
+    Deterministic hash-based assignment: a user's variant is a stable
+    function of (user_id, experiment_id), not a fresh random draw.
+    This is what real experimentation platforms do — it guarantees a
+    user sees the same variant on every visit without needing to store
+    a sticky cookie/session flag, and it's reproducible across reruns.
+    """
+    assignments = []
+    for (experiment_id, exp_def) in zip(
+        [row[0] for row in experiment_rows], EXPERIMENTS
+    ):
+        variants = exp_def["variants"]
+        weights = exp_def["variant_weights"]
+        cum_weights = np.cumsum(weights)
+        for uid in user_ids:
+            # hashlib (not Python's built-in hash()) because hash() is
+            # salted per-process via PYTHONHASHSEED — it would assign
+            # different variants to the same user on every rerun.
+            digest = hashlib.md5(f"{uid}:{experiment_id}".encode()).hexdigest()
+            bucket = (int(digest, 16) % 10_000) / 10_000
+            variant_idx = int(np.searchsorted(cum_weights, bucket))
+            variant_idx = min(variant_idx, len(variants) - 1)
+            variant = variants[variant_idx]
+            assigned_at = SIM_START + timedelta(days=random.randint(0, max(SIM_DAYS - 1, 0)))
+            assignments.append((uid, experiment_id, variant, assigned_at))
+    return assignments
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -323,7 +475,8 @@ def main():
 
     print("Truncating existing data...")
     cur.execute("""
-        TRUNCATE badges, user_points, widget_events, sessions, widgets, users
+        TRUNCATE experiment_assignments, experiments, badges, user_points,
+                 widget_events, sessions, widgets, users
         RESTART IDENTITY CASCADE;
     """)
     conn.commit()
@@ -335,7 +488,7 @@ def main():
     users = generate_users(N_USERS)
     inserted_users = execute_values(
         cur,
-        "INSERT INTO users (signup_date, country, device_type) VALUES %s "
+        "INSERT INTO users (signup_date, country, device_type, acquisition_channel) VALUES %s "
         "RETURNING user_id, signup_date",
         users,
         page_size=1000,
@@ -360,7 +513,11 @@ def main():
     print(f"  -> {len(inserted_widgets)} widgets inserted")
 
     widgets_with_ids = [(w[0], w[1], None, None, w[2]) for w in inserted_widgets]
-    users_with_ids = [(u[0], u[1]) for u in inserted_users]
+    # inserted_users preserves input order (single bulk INSERT...VALUES, no
+    # ORDER BY), so zipping positionally with the original `users` list to
+    # recover acquisition_channel is safe here.
+    users_with_ids = [(inserted_users[i][0], inserted_users[i][1], users[i][3])
+                       for i in range(len(inserted_users))]
 
     # --- SESSIONS + WIDGET_EVENTS ---
     print("Generating sessions and widget events (this is the big one)...")
@@ -386,7 +543,7 @@ def main():
     # --- WIDGET_EVENTS (chunked with retry/reconnect) ---
     print("Inserting widget_events (batched, with retry on connection drop)...")
     events_final = [
-        (e[0], e[1], temp_to_real[e[2]], e[3], e[4], e[5])
+        (e[0], e[1], temp_to_real[e[2]], e[3], e[4], e[5], Json(e[6]))
         for e in event_rows
     ]
 
@@ -400,7 +557,7 @@ def main():
                 execute_values(
                     cur,
                     """INSERT INTO widget_events
-                       (widget_id, user_id, session_id, event_type, event_timestamp, points_earned)
+                       (widget_id, user_id, session_id, event_type, event_timestamp, points_earned, properties)
                        VALUES %s""",
                     chunk,
                     page_size=CHUNK_SIZE,
@@ -450,6 +607,54 @@ def main():
         )
         conn.commit()
     print(f"  -> {len(badges)} badges inserted")
+
+    # --- USER_SEGMENT (post-hoc, derived from actual session/points behavior) ---
+    print("Computing user_segment (free/premium/churned)...")
+    segment_rows = generate_user_segments(user_ids, sessions, user_points_rows)
+    execute_values(
+        cur,
+        """UPDATE users SET user_segment = data.segment
+           FROM (VALUES %s) AS data (user_id, segment)
+           WHERE users.user_id = data.user_id""",
+        segment_rows,
+        page_size=2000,
+    )
+    conn.commit()
+    seg_counts = {}
+    for (_uid, seg) in segment_rows:
+        seg_counts[seg] = seg_counts.get(seg, 0) + 1
+    print(f"  -> segments: {seg_counts}")
+
+    # --- EXPERIMENTS + EXPERIMENT_ASSIGNMENTS ---
+    print(f"Seeding {len(EXPERIMENTS)} experiments...")
+    experiment_insert_rows = [
+        (exp["name"], exp["hypothesis"], exp["metric"], SIM_START,
+         SIM_START + timedelta(days=30), "completed")
+        for exp in EXPERIMENTS
+    ]
+    inserted_experiments = execute_values(
+        cur,
+        """INSERT INTO experiments
+           (experiment_name, hypothesis, metric, start_date, end_date, status)
+           VALUES %s RETURNING experiment_id""",
+        experiment_insert_rows,
+        page_size=100,
+        fetch=True,
+    )
+    conn.commit()
+    print(f"  -> {len(inserted_experiments)} experiments inserted")
+
+    print("Assigning users to experiment variants (deterministic hash-based)...")
+    assignment_rows = generate_experiment_assignments(user_ids, inserted_experiments)
+    execute_values(
+        cur,
+        """INSERT INTO experiment_assignments
+           (user_id, experiment_id, variant, assigned_at) VALUES %s""",
+        assignment_rows,
+        page_size=2000,
+    )
+    conn.commit()
+    print(f"  -> {len(assignment_rows)} experiment_assignments inserted")
 
     cur.close()
     conn.close()
