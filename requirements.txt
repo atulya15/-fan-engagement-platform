@@ -1,0 +1,7 @@
+psycopg2-binary>=2.9
+python-dotenv>=1.0
+faker>=24.0
+numpy>=1.26
+pandas>=2.2
+streamlit>=1.58
+plotly>=5.24

@@ -1,8 +1,6 @@
-# Fan Engagement Platform — Analytics Project
+# Fan Engagement Platform — Product Analytics Platform
 
-An end-to-end analytics project simulating a sports/media **fan engagement & gamification platform** (polls, trivia, predictions, leaderboards — in the spirit of LiveLike's widget products). It models, generates, queries, and visualizes engagement data using a real cloud Postgres database and a self-hosted BI dashboard.
-
-The goal: demonstrate the full analytics workflow a Data Analyst would own — schema design → realistic synthetic data → a clean, commented SQL analysis layer → a polished Metabase dashboard — not just a notebook with a CSV.
+An end-to-end **product analytics platform** simulating a sports/media fan engagement & gamification product (polls, trivia, predictions, leaderboards — in the spirit of LiveLike's widget products). Schema design → realistic synthetic data at scale → a documented metrics layer → an interactive executive dashboard — the kind of internal tool a data team at a consumer product company actually builds and lives in, not a one-off notebook.
 
 ---
 
@@ -12,8 +10,8 @@ The goal: demonstrate the full analytics workflow a Data Analyst would own — s
 |---|---|
 | Database | PostgreSQL (hosted on Supabase, free tier) |
 | Data generation | Python (`faker`, `numpy`, `psycopg2`) |
-| Analysis | SQL (CTEs, window functions, subqueries, conditional aggregation) |
-| Dashboards | Metabase (self-hosted via Docker) |
+| Metrics layer | Python (`pandas`) wrappers over parameterized `.sql` files |
+| Dashboard | Streamlit + Plotly (interactive, in-repo — not an external BI tool) |
 
 ---
 
@@ -21,7 +19,7 @@ The goal: demonstrate the full analytics workflow a Data Analyst would own — s
 
 ![Architecture Diagram](architecture.png)
 
-Synthetic data is generated in Python and batch-loaded into Supabase Postgres. `queries.sql` contains the analysis layer that runs against Postgres. Metabase connects to the same database and renders the dashboard.
+Synthetic data is generated in Python and batch-loaded into Supabase Postgres. The `metrics/` module (Phase 2) wraps every business metric in a documented `.sql` file + Python function returning a pandas DataFrame. `dashboard/app.py` (Phase 3) pulls exclusively from `metrics/` — no metric is computed inline in the dashboard, so every chart and any future consumer of `metrics/` always agree on the number. `queries.sql` remains as a standalone, heavily-commented SQL reference layer (8 queries) separate from the parameterized metrics module.
 
 ---
 
@@ -84,7 +82,7 @@ DATABASE_URL=postgresql://postgres.xxxxx:yourpassword@aws-region.pooler.supabase
 ### 2. Install dependencies
 
 ```bash
-pip install psycopg2-binary python-dotenv faker numpy
+pip install -r requirements.txt
 ```
 
 ### 3. Build the schema and generate data
@@ -104,10 +102,10 @@ Open `queries.sql` and run any query against your database (via the Supabase SQL
 ### 5. Launch the dashboard
 
 ```bash
-docker run -d -p 3000:3000 --name metabase metabase/metabase
+streamlit run dashboard/app.py
 ```
 
-Open `http://localhost:3000`, connect Metabase to your Supabase database (PostgreSQL, SSL mode `require`), and build the dashboard from the saved questions.
+Open `http://localhost:8501`. Seven tabs: Overview, Retention, Funnels, Content, Growth, Experiments, Recommendations (the last two are placeholders until Phases 4-5 land). Every chart pulls from the `metrics/` layer — nothing is computed inline in the dashboard.
 
 ---
 
@@ -130,19 +128,17 @@ Open `http://localhost:3000`, connect Metabase to your Supabase database (Postgr
 
 ## Dashboard
 
-The Metabase dashboard is organized into two tabs:
+A Streamlit app (`dashboard/app.py`), not an external BI tool — interactive, in-repo, and pulling exclusively from the `metrics/` layer. Seven tabs:
 
-**Tab 1 — Overview** (the at-a-glance health metrics):
-1. DAU / WAU / MAU trend line
-2. Widget engagement rate by type (bar)
-3. Engagement funnel (funnel chart)
-4. Engagement value by user tier (power-law bar)
+1. **Overview** — DAU/WAU/MAU trend, stickiness (DAU/MAU), session duration/frequency percentiles, one-line insight under each chart.
+2. **Retention** — cohort retention heatmap (censored cells shown blank, not a misleading 0%), Day-N bounded vs. unbounded retention, rolling 28-day retention, segment breakdowns by acquisition channel and device.
+3. **Funnels** — signup → first view → first engagement → repeat engagement → premium conversion (funnel chart), plus a per-channel breakdown.
+4. **Content** — engagement rate by widget type × sport category, engagement-depth distribution, top/bottom widget performance ranking.
+5. **Growth** — new/returning/resurrected users (stacked area), Quick Ratio over time.
+6. **Experiments** — placeholder pending Phase 4.
+7. **Recommendations** — placeholder pending Phase 5.
 
-**Tab 2 — Leaderboard & Retention** (the detail tables):
-5. Retention cohort heatmap (conditional-formatted table)
-6. Top 10 leaderboard (live table)
-
-*(Screenshots below.)*
+*(Screenshots from the prior Metabase-based version below are stale and will be replaced once the Streamlit dashboard is deployed in Phase 6.)*
 
 ![Overview Tab](dashboard-overview.png)
 
@@ -193,5 +189,8 @@ This project batch-computes `user_points` from `widget_events` in `generate_data
 | `generate_data.py` | Synthetic data generation and batch loading |
 | `verify_data.py` | Data validation (row counts, orphan checks, distributions) |
 | `queries.sql` | The 8-query analysis layer, fully commented |
+| `metrics/` | Parameterized `.sql` files + Python wrappers — the metrics layer the dashboard reads from |
+| `dashboard/app.py` | Streamlit executive dashboard (7 tabs) |
+| `requirements.txt` | Pinned dependencies |
 | `architecture.png` | Data flow diagram |
 | `README.md` | This file |
