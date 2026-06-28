@@ -9,6 +9,7 @@ Run with:
     streamlit run dashboard/app.py
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from experimentation.analyze import (
     analyze_onboarding_experiment,
     analyze_push_experiment,
 )
+from recommendations.serve import get_recommendation, train_recommender_state
 
 st.set_page_config(
     page_title="Fan Engagement Platform",
@@ -668,6 +670,78 @@ with tab_experiments:
 # ============================================================
 # RECOMMENDATIONS (Phase 5)
 # ============================================================
+@st.cache_resource(show_spinner=False)
+def load_recommender_state():
+    return train_recommender_state()
+
+
 with tab_recs:
-    st.info("📍 Coming in Phase 5 — collaborative filtering + content-based recommendation engine "
-            "with cold-start handling, evaluated on a temporal train/test split.")
+    st.caption("Collaborative filtering (ALS), content-based cold-start fallback, and a LightGBM hybrid ranker — "
+               "evaluated on a temporal train/test split (train: first ~10 months, test: last ~2).")
+    st.warning("⚠️ **Catalog-size caveat:** this product has only 60 widgets total. A Top-10 recommendation covers "
+               "~17% of the entire catalog, so the Recall@10/NDCG@10 numbers below are mechanically much higher "
+               "than they'd be for a real catalog of thousands of items. The methodology is the same either way — "
+               "the absolute metric values are not comparable to a production-scale system.")
+
+    eval_path = Path(__file__).parent.parent / "recommendations" / "eval_results.json"
+    if eval_path.exists():
+        with open(eval_path) as f:
+            eval_results = json.load(f)
+        st.subheader("Offline evaluation: CF-only vs. content-only vs. hybrid")
+        st.caption(f"{eval_results['n_test_users']} test users ({eval_results['n_warm']} warm, "
+                   f"{eval_results['n_cold']} cold-start) · {eval_results['catalog_size']}-widget catalog")
+
+        summary_df = pd.DataFrame(eval_results["summary"])
+        pivot_recall = summary_df.pivot(index="method", columns="segment", values="recall_at_10")
+        pivot_ndcg = summary_df.pivot(index="method", columns="segment", values="ndcg_at_10")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Recall@10**")
+            fig = px.bar(pivot_recall.reset_index(), x="method", y=["warm_only", "cold_only"], barmode="group",
+                         color_discrete_sequence=[ACCENT, "#F85149"])
+            fig.update_layout(template=PLOTLY_TEMPLATE, height=320, margin=dict(t=10, b=10),
+                               legend=dict(orientation="h", y=1.15))
+            st.plotly_chart(fig, width='stretch')
+        with c2:
+            st.markdown("**NDCG@10**")
+            fig = px.bar(pivot_ndcg.reset_index(), x="method", y=["warm_only", "cold_only"], barmode="group",
+                         color_discrete_sequence=[ACCENT, "#F85149"])
+            fig.update_layout(template=PLOTLY_TEMPLATE, height=320, margin=dict(t=10, b=10),
+                               legend=dict(orientation="h", y=1.15))
+            st.plotly_chart(fig, width='stretch')
+
+        cf_cold_recall = pivot_recall.loc["cf", "cold_only"]
+        content_cold_recall = pivot_recall.loc["content", "cold_only"]
+        hybrid_cold_recall = pivot_recall.loc["hybrid", "cold_only"]
+        insight(f"CF-only scores {cf_cold_recall:.3f} recall on cold-start users — it has zero history to work "
+                f"with, so it can't recommend at all. Content-based scores {content_cold_recall:.3f} (it's "
+                f"specifically the cold-start handler). Hybrid scores {hybrid_cold_recall:.3f} — it degrades "
+                "gracefully instead of going blind, because the CF-score feature just defaults to 0 for unscorable users "
+                "rather than breaking the whole ranking.")
+    else:
+        st.info("Run `python recommendations/run_evaluation.py` to generate the offline evaluation results.")
+
+    st.divider()
+    st.subheader("Try it: get recommendations for a user")
+    st.caption("Trains the hybrid model once per dashboard session (~1-2 min first time, instant after) — "
+               "this is the same model the FastAPI `/recommend` endpoint serves.")
+
+    user_id_input = st.number_input("User ID", min_value=1, max_value=10000, value=7493, step=1)
+    if st.button("Get recommendations"):
+        with st.spinner("Training models (first call only)..."):
+            state = load_recommender_state()
+        result = get_recommendation(state, int(user_id_input), n=10)
+        if result is None:
+            st.error(f"user_id {user_id_input} not found.")
+        else:
+            badge_color = "#D29922" if result["is_cold_start"] else "#3FB950"
+            st.markdown(
+                f"<div style='display:inline-block;background:{badge_color}22;border:1px solid {badge_color};"
+                f"color:{badge_color};padding:0.25rem 0.7rem;border-radius:16px;font-weight:700;"
+                f"font-size:0.8rem;'>{result['method_used']}</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(result["why"])
+            rec_df = pd.DataFrame(result["recommendations"])
+            st.dataframe(rec_df, width='stretch', hide_index=True)

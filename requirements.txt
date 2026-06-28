@@ -1,7 +1,14 @@
 psycopg2-binary>=2.9
 python-dotenv>=1.0
 faker>=24.0
-numpy>=1.26
+numpy>=1.26,<2.1  # capped below 2.1 for compatibility with implicit/lightgbm's build chain at install time
 pandas>=2.2
 streamlit>=1.58
 plotly>=5.24
+scipy>=1.13
+statsmodels>=0.14
+scikit-learn>=1.5
+implicit>=0.7
+lightgbm>=4.0
+fastapi>=0.110
+uvicorn>=0.30
