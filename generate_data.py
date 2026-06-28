@@ -93,6 +93,41 @@ CHURN_WINDOW_DAYS = 45
 PREMIUM_POINTS_PERCENTILE = 0.75
 PREMIUM_CONVERSION_PROB = 0.70
 
+# ------------------------------------------------------------
+# Experiment treatment effects. Assigning users to variants (Phase 1)
+# without making the variant actually change behavior would make Phase
+# 4's analysis engine find nothing to analyze -- these constants give
+# each pre-built experiment a real, but modest and not artificially
+# obvious, causal effect baked into the generated data, so the stats
+# engine has something genuine to detect (or correctly fail to detect,
+# if underpowered -- that's a real outcome too, not a bug).
+#
+#   - Push notification timing: ml_optimized sends get a session-count
+#     multiplier on top of the channel-quality multiplier; morning is
+#     the baseline, evening is slightly worse (notification fatigue
+#     from a fixed evening slot competing with prime-time engagement
+#     hours already in random_time_on_day's hour_weights).
+#   - Personalized feed: treatment users get an explicit bonus session
+#     injected at exactly day 7 (with some probability, not guaranteed,
+#     so the effect has realistic variance rather than a suspiciously
+#     clean split). This was NOT modeled by skewing the existing
+#     session-timing distribution earlier -- that was tried first and
+#     produced the WRONG sign: front-loading a user's FIXED session
+#     count into the days right after signup necessarily pulls
+#     probability mass AWAY from day 7+, which actively lowers "still
+#     active by day 7" rather than raising it (caught by checking the
+#     actual post-generation numbers, not assumed). An explicit
+#     additive bonus session avoids that trap entirely.
+#   - Onboarding steps: treatment users get a boosted impression-to-
+#     interaction conversion probability, but ONLY on their first-ever
+#     session -- modeling "a simpler onboarding flow gets a user to
+#     their first action faster," not a permanent conversion-rate boost.
+# ------------------------------------------------------------
+PUSH_VARIANT_MULTIPLIER = {"morning": 1.00, "evening": 0.95, "ml_optimized": 1.18}
+FEED_DECAY_DIVISOR = 2.2
+FEED_TREATMENT_DAY7_BONUS_PROB = 0.45
+ONBOARDING_TREATMENT_FIRST_SESSION_BOOST = 0.15  # additive, capped at 0.95
+
 SPORTS = ["Football", "Basketball", "Cricket", "Soccer", "Baseball", "Tennis"]
 WIDGET_TYPES = ["poll", "trivia", "prediction", "leaderboard"]
 N_WIDGETS = 60  # spread across sports/types over the 12-month window
@@ -203,17 +238,19 @@ def generate_users(n_users: int):
 # ============================================================
 # STEP 2: ENGAGEMENT WEIGHT (power-law) PER USER
 # ============================================================
-def generate_engagement_weights(n_users: int, channels: np.ndarray) -> np.ndarray:
+def generate_engagement_weights(n_users: int, channels: np.ndarray, push_variants: np.ndarray) -> np.ndarray:
     """
     Returns a session-count target per user following a power-law-like
     curve: ~20% of users generate ~78% of total sessions.
     Calibrated via rank-transform of a Pareto draw, validated to hit
     realistic 80/20-ish engagement skew (see project notes / README).
 
-    The base power-law curve is then scaled per-user by their
-    acquisition channel's quality multiplier, so organic/referral users
-    skew toward higher engagement than paid_social/influencer users —
-    without breaking the underlying power-law shape.
+    The base power-law curve is then scaled per-user by two independent
+    multipliers: their acquisition channel's quality multiplier (so
+    organic/referral users skew toward higher engagement than
+    paid_social/influencer users), and their push-notification-timing
+    experiment variant (the Experiment C treatment effect) — without
+    breaking the underlying power-law shape.
     """
     weights = RNG.pareto(1.5, n_users) + 1
     ranks = (np.argsort(np.argsort(weights)) + 0.5) / n_users  # uniform 0..1
@@ -221,8 +258,9 @@ def generate_engagement_weights(n_users: int, channels: np.ndarray) -> np.ndarra
     min_sessions, max_sessions = 1, 250
     counts = (ranks ** exponent) * (max_sessions - min_sessions) + min_sessions
 
-    multipliers = np.array([CHANNEL_QUALITY_MULTIPLIER[c] for c in channels])
-    counts = counts * multipliers
+    channel_mult = np.array([CHANNEL_QUALITY_MULTIPLIER[c] for c in channels])
+    push_mult = np.array([PUSH_VARIANT_MULTIPLIER[v] for v in push_variants])
+    counts = counts * channel_mult * push_mult
 
     return np.clip(counts.astype(int), min_sessions, max_sessions)
 
@@ -245,17 +283,25 @@ def generate_widgets(n_widgets: int):
 # ============================================================
 # STEP 4: SESSIONS + WIDGET_EVENTS (generated together per user)
 # ============================================================
-def generate_sessions_and_events(users_with_ids, widgets_with_ids):
+def generate_sessions_and_events(users_with_ids, widgets_with_ids, assignments_by_user):
     """
     NOTE: session_id here is a temporary local counter (1..N) used only
     to link events to sessions before either is inserted. The real
     auto-generated session_id from Postgres is mapped back in main().
+
+    assignments_by_user: {user_id: {experiment_name: variant}} — used
+    to apply the Experiment A (feed personalization) and Experiment B
+    (onboarding) treatment effects inline, since both affect WHEN/HOW
+    a session/interaction happens, not just how many.
     """
     sessions = []
     event_rows = []
 
     channels = np.array([u[2] for u in users_with_ids])
-    engagement_weights = generate_engagement_weights(len(users_with_ids), channels)
+    push_variants = np.array([
+        assignments_by_user[u[0]]["Push Notification Timing"] for u in users_with_ids
+    ])
+    engagement_weights = generate_engagement_weights(len(users_with_ids), channels, push_variants)
     widget_launch = {w[0]: w[4] for w in widgets_with_ids}
     widget_type_map = {w[0]: w[1] for w in widgets_with_ids}
 
@@ -268,9 +314,25 @@ def generate_sessions_and_events(users_with_ids, widgets_with_ids):
         if active_days <= 0:
             continue
 
-        day_offsets = exponential_offsets_no_pileup(active_days / 2.2, n_sessions, active_days)
+        exp = assignments_by_user[user_id]
+        feed_is_treatment = exp["Personalized Feed vs Chronological"] == "treatment"
+        onboarding_is_treatment = exp["Onboarding Steps Reduction"] == "treatment"
 
-        for day_off in sorted(day_offsets):
+        day_offsets = list(exponential_offsets_no_pileup(active_days / FEED_DECAY_DIVISOR, n_sessions, active_days))
+
+        # Experiment A treatment effect: an explicit bonus session at
+        # exactly day 7, applied with some probability (not guaranteed)
+        # so the effect has realistic variance. Additive, not a
+        # redistribution of existing sessions -- see the constant's
+        # comment above for why redistribution produced the wrong sign.
+        if feed_is_treatment and active_days > 7 and random.random() < FEED_TREATMENT_DAY7_BONUS_PROB:
+            day_offsets.append(7)
+
+        sorted_offsets = sorted(day_offsets)
+
+        for session_idx, day_off in enumerate(sorted_offsets):
+            is_first_session = (session_idx == 0)
+
             session_day = signup_date + timedelta(days=int(day_off))
             not_before = signup_date if day_off == 0 else None
             open_time = random_time_on_day(session_day, not_before=not_before)
@@ -293,13 +355,21 @@ def generate_sessions_and_events(users_with_ids, widgets_with_ids):
                 w_type = widget_type_map[widget_id]
                 conv = WIDGET_CONVERSION[w_type]
 
+                impression_to_interaction = conv["impression_to_interaction"]
+                if is_first_session and onboarding_is_treatment:
+                    # Experiment B treatment effect: a simpler onboarding
+                    # flow gets a user to their first action faster, on
+                    # their very first session only -- not a permanent
+                    # conversion-rate change.
+                    impression_to_interaction = min(impression_to_interaction + ONBOARDING_TREATMENT_FIRST_SESSION_BOOST, 0.95)
+
                 impression_ts = open_time + timedelta(
                     seconds=random.randint(0, max(duration_min * 60 - 1, 1))
                 )
                 event_rows.append((widget_id, user_id, session_id_counter,
                                     "impression", impression_ts, POINTS_MAP["impression"], {}))
 
-                if random.random() < conv["impression_to_interaction"]:
+                if random.random() < impression_to_interaction:
                     interaction_ts = min(
                         impression_ts + timedelta(seconds=random.randint(1, 30)),
                         close_time,
@@ -518,10 +588,51 @@ def main():
     # recover acquisition_channel is safe here.
     users_with_ids = [(inserted_users[i][0], inserted_users[i][1], users[i][3])
                        for i in range(len(inserted_users))]
+    user_ids = [u[0] for u in users_with_ids]
+
+    # --- EXPERIMENTS + EXPERIMENT_ASSIGNMENTS ---
+    # Generated BEFORE sessions/events, not after: the feed-personalization
+    # and onboarding treatment effects need each user's variant assignment
+    # available while sessions/events are being generated (see
+    # generate_sessions_and_events), not as a label applied after the fact.
+    print(f"Seeding {len(EXPERIMENTS)} experiments...")
+    experiment_insert_rows = [
+        (exp["name"], exp["hypothesis"], exp["metric"], SIM_START,
+         SIM_START + timedelta(days=30), "completed")
+        for exp in EXPERIMENTS
+    ]
+    inserted_experiments = execute_values(
+        cur,
+        """INSERT INTO experiments
+           (experiment_name, hypothesis, metric, start_date, end_date, status)
+           VALUES %s RETURNING experiment_id""",
+        experiment_insert_rows,
+        page_size=100,
+        fetch=True,
+    )
+    conn.commit()
+    print(f"  -> {len(inserted_experiments)} experiments inserted")
+
+    print("Assigning users to experiment variants (deterministic hash-based)...")
+    assignment_rows = generate_experiment_assignments(user_ids, inserted_experiments)
+    execute_values(
+        cur,
+        """INSERT INTO experiment_assignments
+           (user_id, experiment_id, variant, assigned_at) VALUES %s""",
+        assignment_rows,
+        page_size=2000,
+    )
+    conn.commit()
+    print(f"  -> {len(assignment_rows)} experiment_assignments inserted")
+
+    experiment_id_to_name = {inserted_experiments[i][0]: EXPERIMENTS[i]["name"] for i in range(len(EXPERIMENTS))}
+    assignments_by_user = {uid: {} for uid in user_ids}
+    for (uid, exp_id, variant, _assigned_at) in assignment_rows:
+        assignments_by_user[uid][experiment_id_to_name[exp_id]] = variant
 
     # --- SESSIONS + WIDGET_EVENTS ---
     print("Generating sessions and widget events (this is the big one)...")
-    sessions, event_rows = generate_sessions_and_events(users_with_ids, widgets_with_ids)
+    sessions, event_rows = generate_sessions_and_events(users_with_ids, widgets_with_ids, assignments_by_user)
     print(f"  -> {len(sessions)} sessions, {len(event_rows)} widget_events generated")
 
     print("Inserting sessions...")
@@ -584,7 +695,6 @@ def main():
 
     # --- USER_POINTS ---
     print("Rolling up user_points...")
-    user_ids = [u[0] for u in users_with_ids]
     user_points_rows = generate_user_points(user_ids, events_final)
     execute_values(
         cur,
@@ -625,41 +735,9 @@ def main():
         seg_counts[seg] = seg_counts.get(seg, 0) + 1
     print(f"  -> segments: {seg_counts}")
 
-    # --- EXPERIMENTS + EXPERIMENT_ASSIGNMENTS ---
-    print(f"Seeding {len(EXPERIMENTS)} experiments...")
-    experiment_insert_rows = [
-        (exp["name"], exp["hypothesis"], exp["metric"], SIM_START,
-         SIM_START + timedelta(days=30), "completed")
-        for exp in EXPERIMENTS
-    ]
-    inserted_experiments = execute_values(
-        cur,
-        """INSERT INTO experiments
-           (experiment_name, hypothesis, metric, start_date, end_date, status)
-           VALUES %s RETURNING experiment_id""",
-        experiment_insert_rows,
-        page_size=100,
-        fetch=True,
-    )
-    conn.commit()
-    print(f"  -> {len(inserted_experiments)} experiments inserted")
-
-    print("Assigning users to experiment variants (deterministic hash-based)...")
-    assignment_rows = generate_experiment_assignments(user_ids, inserted_experiments)
-    execute_values(
-        cur,
-        """INSERT INTO experiment_assignments
-           (user_id, experiment_id, variant, assigned_at) VALUES %s""",
-        assignment_rows,
-        page_size=2000,
-    )
-    conn.commit()
-    print(f"  -> {len(assignment_rows)} experiment_assignments inserted")
-
     cur.close()
     conn.close()
     print("\n Data generation complete.")
-
 
 if __name__ == "__main__":
     main()
