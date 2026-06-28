@@ -1,19 +1,20 @@
 """
 recommendations/api.py
 ========================
-FastAPI service exposing the hybrid recommender as `/recommend`. Model
-training (recommendations/serve.py:train_recommender_state) happens
-ONCE at startup via a lifespan hook, not per-request -- ALS + LightGBM
-training takes ~2 minutes on this dataset, which is fine as a startup
-cost and completely wrong as a per-request cost.
+Recommendation endpoints as a FastAPI router, mounted by api/main.py
+(the single deployed backend for Phase 6). Kept in recommendations/
+rather than api/ since it's tightly coupled to recommendations/serve.py
+-- the router is the "public interface" of this module, same as how
+metrics/ exposes Python functions and dashboard/app.py calls them.
 
-Run with:
-    uvicorn recommendations.api:app --reload
+Model training (recommendations/serve.py:train_recommender_state)
+happens ONCE, triggered by api/main.py's lifespan hook via
+`init_state()` below -- not per-request. ALS + LightGBM training takes
+~2 minutes on this dataset, fine as a startup cost, wrong as a
+per-request cost.
 """
 
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from recommendations.serve import get_recommendation, train_recommender_state
@@ -21,16 +22,14 @@ from recommendations.serve import get_recommendation, train_recommender_state
 STATE: dict = {}
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def init_state():
+    """Called once from api/main.py's lifespan startup hook."""
     print("Training recommendation models (one-time startup cost, ~2 min)...")
     STATE.update(train_recommender_state())
-    print("Models ready.")
-    yield
-    STATE.clear()
+    print("Recommendation models ready.")
 
 
-app = FastAPI(title="Fan Engagement Platform — Recommendations API", lifespan=lifespan)
+router = APIRouter(tags=["recommendations"])
 
 
 class RecommendationItem(BaseModel):
@@ -47,7 +46,7 @@ class RecommendationResponse(BaseModel):
     recommendations: list[RecommendationItem]
 
 
-@app.get("/recommend", response_model=RecommendationResponse)
+@router.get("/recommend", response_model=RecommendationResponse)
 def recommend(user_id: int, n: int = 10):
     if "hybrid_model" not in STATE:
         raise HTTPException(503, "Models still training, try again shortly.")
@@ -57,6 +56,6 @@ def recommend(user_id: int, n: int = 10):
     return result
 
 
-@app.get("/health")
+@router.get("/recommend/health")
 def health():
     return {"status": "ok", "models_loaded": "hybrid_model" in STATE}

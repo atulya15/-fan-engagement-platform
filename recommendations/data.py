@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 
-from metrics.db import run_query
+from metrics.db import run_query_chunked
 
 # Implicit-feedback confidence weights by event type, mirroring the
 # POINTS_MAP weighting already used in generate_data.py's gamification
@@ -39,7 +39,7 @@ def load_events() -> pd.DataFrame:
     JOIN widgets w ON w.widget_id = we.widget_id
     JOIN users u ON u.user_id = we.user_id
     """
-    df = run_query(sql)
+    df = run_query_chunked(sql)
     df["event_timestamp"] = pd.to_datetime(df["event_timestamp"])
     df["launch_date"] = pd.to_datetime(df["launch_date"])
     df["signup_date"] = pd.to_datetime(df["signup_date"])
