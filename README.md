@@ -1,6 +1,12 @@
-# Fan Engagement Platform — Product Analytics Platform
+# Pulse — Fan Engagement Analytics Platform
 
-An end-to-end **product analytics platform** simulating a sports/media fan engagement & gamification product (polls, trivia, predictions, leaderboards — in the spirit of LiveLike's widget products). Schema design → realistic synthetic data at scale → a documented metrics layer → an interactive executive dashboard — the kind of internal tool a data team at a consumer product company actually builds and lives in, not a one-off notebook.
+An end-to-end **product analytics platform** simulating a sports/media fan engagement & gamification product (polls, trivia, predictions, leaderboards — in the spirit of LiveLike's widget products). Schema design → realistic synthetic data at scale → a documented metrics layer → A/B experimentation → a hybrid recommendation engine → an interactive dashboard → a deployed, cinematic showcase site. The kind of full-stack analytics + ML system a data/product team at a consumer product company actually builds and lives in, not a one-off notebook.
+
+**Live:**
+- 🌐 Showcase site: **[fan-engagement-platform-teal.vercel.app](https://fan-engagement-platform-teal.vercel.app)**
+- 🔌 API (live recommendation demo): **[fan-engagement-platform-api.onrender.com](https://fan-engagement-platform-api.onrender.com)**
+
+![Hero](docs/screenshots/hero.png)
 
 ---
 
@@ -11,7 +17,12 @@ An end-to-end **product analytics platform** simulating a sports/media fan engag
 | Database | PostgreSQL (hosted on Supabase, free tier) |
 | Data generation | Python (`faker`, `numpy`, `psycopg2`) |
 | Metrics layer | Python (`pandas`) wrappers over parameterized `.sql` files |
+| Experimentation | Python — two-sample tests, CUPED variance reduction, sequential testing |
+| Recommendations | `implicit` (ALS collaborative filtering), `scikit-learn` (content similarity), `LightGBM` (hybrid ranker) |
 | Dashboard | Streamlit + Plotly (interactive, in-repo — not an external BI tool) |
+| Showcase site | Next.js (App Router) + TypeScript + Tailwind + GSAP/Lenis scroll choreography |
+| API | FastAPI, deployed on Render |
+| Site hosting | Vercel |
 
 ---
 
@@ -19,7 +30,23 @@ An end-to-end **product analytics platform** simulating a sports/media fan engag
 
 ![Architecture Diagram](architecture.png)
 
-Synthetic data is generated in Python and batch-loaded into Supabase Postgres. The `metrics/` module (Phase 2) wraps every business metric in a documented `.sql` file + Python function returning a pandas DataFrame. `dashboard/app.py` (Phase 3) pulls exclusively from `metrics/` — no metric is computed inline in the dashboard, so every chart and any future consumer of `metrics/` always agree on the number. `queries.sql` remains as a standalone, heavily-commented SQL reference layer (8 queries) separate from the parameterized metrics module.
+Synthetic data is generated in Python and batch-loaded into Supabase Postgres. The `metrics/` module (Phase 2) wraps every business metric in a documented `.sql` file + Python function returning a pandas DataFrame. `dashboard/app.py` (Phase 3) pulls exclusively from `metrics/` — no metric is computed inline in the dashboard. `experimentation/` (Phase 4) runs the same statistical engine against three pre-seeded A/B tests. `recommendations/` (Phase 5) trains a hybrid CF + content recommender and serves it from both the dashboard and a standalone FastAPI service. `site/` (Phase 6) is a separate Next.js showcase deployed to Vercel, reading a precomputed JSON snapshot (`snapshot/build_snapshot.py`) for instant loads, with one genuinely live piece — a recommendation demo calling the FastAPI service on Render.
+
+```
+Supabase Postgres
+   │
+   ├─ metrics/ ───────────────► dashboard/app.py (Streamlit, 7 tabs)
+   ├─ experimentation/ ───────► dashboard Experiments tab
+   ├─ recommendations/ ───────► dashboard Recommendations tab
+   │        │
+   │        └─ train_and_save.py → recommendations/model_state.pkl
+   │                                       │
+   │                                       ▼
+   │                            api/main.py (FastAPI, deployed on Render)
+   │                                       ▲
+   │                                       │ live fetch
+   └─ snapshot/build_snapshot.py ─► site/data/snapshot.json ─► site/ (Next.js, deployed on Vercel)
+```
 
 ---
 
@@ -88,24 +115,44 @@ pip install -r requirements.txt
 ### 3. Build the schema and generate data
 
 ```bash
-python run_schema.py        # creates the 7 tables + indexes
-python generate_data.py     # generates and loads ~476K rows
+python run_schema.py        # creates the tables + indexes
+python generate_data.py     # generates and loads ~2M rows
 python verify_data.py       # sanity checks: row counts, orphaned FKs, distributions
 ```
 
 `generate_data.py` is idempotent (it truncates and reseeds on every run) and inserts in chunks with retry/reconnect logic, since free-tier pooled connections can drop on long-running batch operations.
 
-### 4. Run the analysis
-
-Open `queries.sql` and run any query against your database (via the Supabase SQL Editor or `psql`).
-
-### 5. Launch the dashboard
+### 4. Launch the dashboard
 
 ```bash
 streamlit run dashboard/app.py
 ```
 
-Open `http://localhost:8501`. Seven tabs: Overview, Retention, Funnels, Content, Growth, Experiments, Recommendations (the last two are placeholders until Phases 4-5 land). Every chart pulls from the `metrics/` layer — nothing is computed inline in the dashboard.
+Open `http://localhost:8501`. Seven tabs, every chart pulling from the `metrics/`, `experimentation/`, and `recommendations/` layers — nothing computed inline in the dashboard.
+
+### 5. Train the recommender (for the API)
+
+```bash
+python -m recommendations.train_and_save
+```
+
+Trains the ALS + LightGBM hybrid model and saves `recommendations/model_state.pkl`. Re-run whenever the underlying data changes; the API loads this file at boot rather than training live (see [Productionizing the recommender](#productionizing-the-recommender) below for why).
+
+### 6. Run the API locally
+
+```bash
+uvicorn api.main:app --reload
+```
+
+### 7. Run the showcase site locally
+
+```bash
+cd site
+npm install
+npm run build && npm run start   # or `npm run dev` for hot-reload
+```
+
+Set `NEXT_PUBLIC_API_URL` in `site/.env.local` to point at your local or deployed API.
 
 ---
 
@@ -126,27 +173,59 @@ Open `http://localhost:8501`. Seven tabs: Overview, Retention, Funnels, Content,
 
 ---
 
-## Dashboard
+## Experimentation
 
-A Streamlit app (`dashboard/app.py`), not an external BI tool — interactive, in-repo, and pulling exclusively from the `metrics/` layer. Seven tabs:
+Three pre-seeded A/B tests, each assigned at signup via deterministic hashing, analyzed with one shared statistical engine (`experimentation/`):
 
-1. **Overview** — DAU/WAU/MAU trend, stickiness (DAU/MAU), session duration/frequency percentiles, one-line insight under each chart.
-2. **Retention** — cohort retention heatmap (censored cells shown blank, not a misleading 0%), Day-N bounded vs. unbounded retention, rolling 28-day retention, segment breakdowns by acquisition channel and device.
-3. **Funnels** — signup → first view → first engagement → repeat engagement → premium conversion (funnel chart), plus a per-channel breakdown.
-4. **Content** — engagement rate by widget type × sport category, engagement-depth distribution, top/bottom widget performance ranking.
-5. **Growth** — new/returning/resurrected users (stacked area), Quick Ratio over time.
-6. **Experiments** — placeholder pending Phase 4.
-7. **Recommendations** — placeholder pending Phase 5.
+- **Personalized feed vs. chronological** — primary metric (bounded Day-7 retention) lift of +100%, guardrail (avg. session duration) clean. **Shipped.**
+- **Push notification timing** — includes a sequential-peeking demonstration: stopping at 75% of the data already looks significant (p < 0.05 on the naive threshold), but the properly alpha-spending-adjusted threshold at that look is stricter — waiting for the full sample is what actually justifies shipping.
+- **Onboarding flow change** — full two-sample test, CI, and guardrail check.
 
-*(Screenshots from the prior Metabase-based version below are stale and will be replaced once the Streamlit dashboard is deployed in Phase 6.)*
+Every result includes CUPED variance reduction, a per-segment breakdown, and an explicit ship/no-ship decision combining statistical and practical significance — not p-value alone.
 
-![Overview Tab](dashboard-overview.png)
-
-![Leaderboard & Retention Tab](dashboard-retention.png)
+![Experiments](docs/screenshots/experiments.png)
 
 ---
 
-## What the Dashboard Reveals (Business Insights)
+## Recommendations
+
+A hybrid recommender (`recommendations/`) combining:
+
+- **Collaborative filtering** — ALS on the implicit-feedback interaction matrix (impressions/interactions/completions weighted by strength).
+- **Content-based similarity** — cosine similarity over widget-type and sport features, the cold-start fallback for users or widgets with no history.
+- **Hybrid ranker** — a LightGBM classifier combining the CF score, content similarity, segment-level content-type affinity, recency, and time-of-day match into a single ranking score.
+
+Evaluated on a **temporal** (not random) train/test split, so the model never sees a user's future interactions during training. Headline finding: pure collaborative filtering goes completely blind on cold-start users (0% Recall@10), while the hybrid model degrades gracefully instead — the whole point of comparing methods rather than shipping CF alone.
+
+![Recommendations](docs/screenshots/recommendations.png)
+
+### Productionizing the recommender
+
+Training (load the full interaction history → ALS → build LightGBM training examples) needs the entire event-level dataset and a sparse interaction matrix in memory at once — `recommendations/train_and_save.py` runs this once and pickles only what `get_recommendation()` actually needs to serve a request (a handful of small lookup dicts and the trained models, not the raw data). The deployed API loads that ~11MB pickle at boot instead of retraining on every cold start — this is also what makes the free-tier Render deployment work at all inside its 512MB memory limit.
+
+---
+
+## Showcase Site (Phase 6)
+
+A scroll-driven cinematic homepage (`site/`, Next.js + GSAP + Lenis) told in seven movements, sharing one persistent SVG point-field across all of them so nothing hard-cuts between sections:
+
+1. **Hook** — the field of fans multiplies and settles into a grid.
+2. **Retention** — the grid resolves into the real cohort heatmap (censored cells fade to neutral, not a false 0%).
+3. **Funnel** — points physically fall into a narrowing funnel mouth, the ones that don't make it colliding and dropping away — the real signup→engagement leak, dramatized.
+4. **Experiments** — a guardrail dip that looks alarming, corrected by the real numbers; a peeking-problem chart shown live.
+5. **Recommendations** — the surviving cohort becomes a node-link graph; a cold-start node gets threaded in via content similarity.
+6. **Scale & impact** — the graph condenses to a point while real headline KPIs cycle through, then unfurls back into the same pulse line the page opened with.
+7. **Dashboard emergence** — that pulse line shrinks into the real dashboard's logo mark, scroll-jacking permanently releases, and the actual interactive dashboard (same routes as the Streamlit app, reimplemented natively) takes over.
+
+Below the fold: the live recommendation demo, calling the deployed FastAPI service directly from the browser.
+
+![Dashboard](docs/screenshots/dashboard-overview.png)
+![Retention](docs/screenshots/retention.png)
+![Funnels](docs/screenshots/funnels.png)
+
+---
+
+## What the Data Reveals (Business Insights)
 
 Written for a product/business audience — what each panel actually tells you.
 
@@ -162,6 +241,12 @@ The top third of users by points ("power users") drive **93% of all points and c
 **4. Retention stabilizes rather than collapsing.**
 After the expected week-0-to-week-1 settling, weekly retention holds steady in the ~40–55% band for mature cohorts rather than decaying to zero — a healthy sign that the gamification loop creates a returning habit, not just one-time curiosity.
 
+**5. Personalization is worth shipping, even when the guardrail looks scary at first glance.**
+The feed-personalization experiment's guardrail (session duration) dipped initially — noise, not a real effect (p = 0.80) — while the primary metric (Day-7 retention) nearly doubled. Takeaway: a single alarming-looking chart isn't a verdict; check statistical significance before reacting to it.
+
+**6. Cold-start users need a different recommendation strategy entirely, not a worse version of the same one.**
+Pure CF has literally nothing to say about a user with no history (0% Recall@10) — the hybrid model's graceful degradation into content-based fallback is what makes recommendations viable for new users at all.
+
 ---
 
 ## Design Notes & Engineering Decisions
@@ -174,15 +259,19 @@ A few choices worth calling out, and bugs caught and fixed along the way:
 
 - **Censored cohorts are shown as blank, not zero.** Recent cohorts that haven't existed long enough to measure week N show `NULL` (blank cells) rather than a misleading `0%`.
 
-### How I'd productionize this
+- **Caught a Supabase free-tier query timeout the hard way.** The recommender's full 3-table join (`widget_events` ⋈ `widgets` ⋈ `users`, ~2M rows) started outright failing `statement_timeout` on the free-tier pooler — every index needed was already in place, it was simply more join than the free compute tier could finish in one statement. Fixed by splitting the query into monthly WHERE-bounded statements instead of one giant join, trading round trips for statements that reliably finish.
 
-This project batch-computes `user_points` from `widget_events` in `generate_data.py`, since the data is synthetic and generated once. In production, `user_points` would be maintained incrementally — via a Postgres trigger on `widget_events` inserts, or a scheduled job recomputing rankings in near-real-time. A trigger keeps the leaderboard always current but adds write-path latency; a scheduled batch job is simpler and sufficient when a few minutes of leaderboard staleness is acceptable (the more common real-world tradeoff). At scale, I'd also partition `widget_events` by month once it grows past a few million rows, since most queries filter by `event_timestamp`.
+- **Caught a hydration mismatch the hard way too.** `toLocaleString()` without an explicit locale rendered different digit grouping on the Node SSR process vs. the browser (`20,62,633` vs `2,062,633`), silently corrupting React's hydration and breaking the cinematic site's scroll-pin measurements downstream. Fixed by pinning `"en-US"` on every call site.
+
+### How I'd productionize this further
+
+This project batch-computes `user_points` from `widget_events` in `generate_data.py`, since the data is synthetic and generated once. In production, `user_points` would be maintained incrementally — via a Postgres trigger on `widget_events` inserts, or a scheduled job recomputing rankings in near-real-time. A trigger keeps the leaderboard always current but adds write-path latency; a scheduled batch job is simpler and sufficient when a few minutes of leaderboard staleness is acceptable (the more common real-world tradeoff). At scale, I'd also partition `widget_events` by month once it grows past a few million rows, since most queries filter by `event_timestamp`. The recommender would similarly move from "retrain via a manual script" to a scheduled retraining job (e.g. nightly), with the API hot-swapping in the new model state rather than requiring a redeploy.
 
 ---
 
 ## Repository Contents
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
 | `schema.sql` | Table definitions, constraints, indexes |
 | `data_dictionary.md` | Full table/column reference with business definitions |
@@ -190,7 +279,14 @@ This project batch-computes `user_points` from `widget_events` in `generate_data
 | `verify_data.py` | Data validation (row counts, orphan checks, distributions) |
 | `queries.sql` | The 8-query analysis layer, fully commented |
 | `metrics/` | Parameterized `.sql` files + Python wrappers — the metrics layer the dashboard reads from |
+| `experimentation/` | Shared A/B testing statistical engine (two-sample tests, CUPED, sequential testing) |
+| `recommendations/` | Hybrid CF + content recommender: training, evaluation, and the FastAPI router that serves it |
 | `dashboard/app.py` | Streamlit executive dashboard (7 tabs) |
-| `requirements.txt` | Pinned dependencies |
+| `api/` | FastAPI app deployed on Render — mounts the recommendation router + a `/snapshot` endpoint |
+| `snapshot/build_snapshot.py` | Precomputes the JSON snapshot the showcase site bakes in at build time |
+| `site/` | The Next.js cinematic showcase site, deployed on Vercel |
+| `DEPLOYMENT_PLAN.md` | Render + Vercel deployment steps, env vars, and known gaps |
+| `requirements.txt` | Pinned Python dependencies |
 | `architecture.png` | Data flow diagram |
+| `docs/screenshots/` | Screenshots used in this README |
 | `README.md` | This file |
