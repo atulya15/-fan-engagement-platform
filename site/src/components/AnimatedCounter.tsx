@@ -1,35 +1,56 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { useInView, animate } from "framer-motion";
+import { useEffect, useState } from "react";
+import { animate, useReducedMotion } from "framer-motion";
+
+let countersAnimatedThisSession = false;
+
+function formatValue(value: number, decimals: number, suffix: string) {
+  return `${value.toLocaleString("en-US", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  })}${suffix}`;
+}
 
 export function AnimatedCounter({
   value,
-  format = (v: number) => Math.round(v).toLocaleString("en-US"),
+  decimals = 0,
+  suffix = "",
   durationMs = 1400,
   className = "",
 }: {
   value: number;
-  format?: (v: number) => string;
+  decimals?: number;
+  suffix?: string;
   durationMs?: number;
   className?: string;
 }) {
-  const ref = useRef<HTMLSpanElement>(null);
-  const inView = useInView(ref, { once: true, margin: "-10% 0px" });
-  const [display, setDisplay] = useState("0");
+  const prefersReducedMotion = useReducedMotion();
+  const finalDisplay = formatValue(value, decimals, suffix);
+  const shouldAnimate =
+    !prefersReducedMotion && !countersAnimatedThisSession;
+
+  const [display, setDisplay] = useState(
+    shouldAnimate ? formatValue(0, decimals, suffix) : finalDisplay
+  );
 
   useEffect(() => {
-    if (!inView) return;
+    if (!shouldAnimate) {
+      setDisplay(finalDisplay);
+      return;
+    }
+
+    countersAnimatedThisSession = true;
     const controls = animate(0, value, {
       duration: durationMs / 1000,
       ease: [0.16, 1, 0.3, 1],
-      onUpdate: (v) => setDisplay(format(v)),
+      onUpdate: (v) => setDisplay(formatValue(v, decimals, suffix)),
     });
     return () => controls.stop();
-  }, [inView, value, durationMs, format]);
+  }, [shouldAnimate, value, durationMs, decimals, suffix, finalDisplay]);
 
   return (
-    <span ref={ref} className={`num ${className}`}>
+    <span className={`num ${className}`}>
       {display}
     </span>
   );

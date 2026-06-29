@@ -10,7 +10,7 @@ import {
   Cell,
   LabelList,
 } from "recharts";
-import type { Funnel } from "@/lib/snapshot";
+import type { FunnelOverall } from "@/lib/snapshot";
 
 const STEP_LABELS: Record<string, string> = {
   signup: "Signup",
@@ -20,7 +20,7 @@ const STEP_LABELS: Record<string, string> = {
   premium_conversion: "Premium conversion",
 };
 
-export function FunnelChartView({ funnel }: { funnel: Funnel }) {
+export function FunnelChartView({ funnel }: { funnel: FunnelOverall }) {
   const data = funnel.steps.map((step, i) => ({
     step: STEP_LABELS[step] ?? step,
     pct: funnel.pct_of_signups[i],
@@ -62,7 +62,7 @@ export function FunnelChartView({ funnel }: { funnel: Funnel }) {
             formatter={(value, _name, item) => {
               const v = Number(value);
               const users = (item?.payload as { users: number })?.users ?? 0;
-              return [`${users.toLocaleString()} users (${v.toFixed(1)}% of signups)`, "Reached"];
+              return [`${users.toLocaleString("en-US")} users (${v.toFixed(1)}% of signups)`, "Reached"];
             }}
           />
           <Bar dataKey="pct" radius={[0, 6, 6, 0]} barSize={28}>

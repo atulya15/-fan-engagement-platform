@@ -1,16 +1,19 @@
 "use client";
 
 import { useRef } from "react";
-import { motion, useScroll, useTransform, MotionValue } from "framer-motion";
-import type { Retention } from "@/lib/snapshot";
+import {
+  motion,
+  useScroll,
+  useTransform,
+  useReducedMotion,
+  MotionValue,
+} from "framer-motion";
+import type { RetentionHeatmap as RetentionHeatmapData } from "@/lib/snapshot";
 
 const VISIBLE_COHORTS = 14;
 
 function colorForValue(v: number | null): string {
   if (v === null) return "transparent";
-  // 0% -> deep surface, 100% -> bright accent. Clamp to the
-  // realistic range observed in this dataset (most cells sit
-  // 15-45%) so color variation is actually visible.
   const t = Math.max(0, Math.min(1, v / 50));
   const r = Math.round(10 + t * (94 - 10));
   const g = Math.round(10 + t * (106 - 10));
@@ -18,7 +21,25 @@ function colorForValue(v: number | null): string {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
-function Cell({
+function StaticCell({ value }: { value: number | null }) {
+  if (value === null) {
+    return <div className="aspect-square rounded-sm bg-white/[0.02]" />;
+  }
+
+  return (
+    <div
+      style={{ backgroundColor: colorForValue(value) }}
+      className="group relative aspect-square rounded-sm"
+      title={`${value.toFixed(1)}%`}
+    >
+      <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[9px] font-medium text-white/0 transition-colors group-hover:text-white/90">
+        {value.toFixed(0)}
+      </span>
+    </div>
+  );
+}
+
+function AnimatedCell({
   value,
   index,
   total,
@@ -51,7 +72,8 @@ function Cell({
   );
 }
 
-export function RetentionHeatmap({ retention }: { retention: Retention }) {
+export function RetentionHeatmap({ retention }: { retention: RetentionHeatmapData }) {
+  const prefersReducedMotion = useReducedMotion();
   const containerRef = useRef<HTMLDivElement>(null);
   const { scrollYProgress } = useScroll({
     target: containerRef,
@@ -90,15 +112,19 @@ export function RetentionHeatmap({ retention }: { retention: Retention }) {
                   <div className="num flex items-center justify-end pr-2 text-[11px] text-muted">
                     {row.cohort_week}
                   </div>
-                  {row.values.map((v, i) => (
-                    <Cell
-                      key={i}
-                      value={v}
-                      index={startIdx + i}
-                      total={totalCells}
-                      progress={scrollYProgress}
-                    />
-                  ))}
+                  {row.values.map((v, i) =>
+                    prefersReducedMotion ? (
+                      <StaticCell key={i} value={v} />
+                    ) : (
+                      <AnimatedCell
+                        key={i}
+                        value={v}
+                        index={startIdx + i}
+                        total={totalCells}
+                        progress={scrollYProgress}
+                      />
+                    )
+                  )}
                 </div>
               );
             })}

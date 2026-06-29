@@ -31,6 +31,7 @@
   --color-background: var(--color-base);
   --color-foreground: var(--color-foreground);
   --font-sans: var(--font-inter);
+  --font-display: var(--font-sora);
   --font-mono: var(--font-mono);
 }
 
@@ -75,6 +76,9 @@
   .border-hairline {
     border-color: var(--color-border);
   }
+  .border-hairline-strong {
+    border-color: var(--color-border-strong);
+  }
   .text-muted {
     color: var(--color-foreground-muted);
   }
@@ -87,6 +91,9 @@
   .num {
     font-family: var(--font-mono);
     font-feature-settings: "tnum";
+  }
+  .font-display {
+    font-family: var(--font-display);
   }
 }
 

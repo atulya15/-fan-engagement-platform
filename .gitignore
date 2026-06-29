@@ -5,3 +5,9 @@ venv/
 .vscode/
 streamlit.log
 .streamlit/secrets.toml
+
+# Local editor/agent tooling -- not part of the application
+.agents/
+.cursor/
+motion-audits/
+skills-lock.json

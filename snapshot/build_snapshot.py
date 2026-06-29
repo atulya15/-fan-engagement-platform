@@ -1,12 +1,12 @@
 """
 snapshot/build_snapshot.py
 ============================
-Builds the single JSON snapshot the Next.js showcase site (site/) is
+Builds the single JSON snapshot the Next.js dashboard site (site/) is
 statically generated from. Pure orchestration -- every number here
 comes from the existing metrics/, experimentation/, and
 recommendations/ modules; no new computation logic lives in this file.
 
-A showcase site cannot have a 60-second load (several underlying
+A dashboard site cannot have a 60-second load (several underlying
 queries take 40-150s on free-tier Supabase, observed directly during
 Phase 4). This script runs once, offline, and writes a static JSON
 file the site reads at build time -- the same "precompute, don't
@@ -25,13 +25,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
+import pandas as pd
 
 from metrics.db import run_query
 from metrics.engagement import dau_wau_mau, session_stats
-from metrics.funnels import funnel_overview
+from metrics.funnels import funnel_overview, funnel_by_channel
 from metrics.growth import weekly_growth
-from metrics.retention import cohort_retention_matrix
-from experimentation.analyze import analyze_push_experiment
+from metrics.retention import (
+    cohort_retention_matrix,
+    day_n_retention,
+    rolling_28d_retention,
+    segment_retention,
+)
+from metrics.content import widget_performance, engagement_by_type_and_category
+from experimentation.analyze import (
+    analyze_feed_experiment,
+    analyze_onboarding_experiment,
+    analyze_push_experiment,
+)
 
 
 def to_native(obj):
@@ -41,6 +52,8 @@ def to_native(obj):
         return {k: to_native(v) for k, v in dataclasses.asdict(obj).items()}
     if isinstance(obj, (np.generic,)):
         return obj.item()
+    if isinstance(obj, (pd.Timestamp,)):
+        return obj.isoformat()
     if isinstance(obj, np.ndarray):
         return [to_native(v) for v in obj.tolist()]
     if isinstance(obj, dict):
@@ -50,6 +63,19 @@ def to_native(obj):
     if isinstance(obj, float) and (obj != obj):  # NaN
         return None
     return obj
+
+
+def pd_isna(v):
+    return v != v  # NaN check without importing pandas here
+
+
+def df_records(df) -> list[dict]:
+    """Generic DataFrame -> list-of-dicts, NaN-safe, for tabular data
+    that doesn't need a bespoke chart-ready shape."""
+    return [
+        {k: (None if pd_isna(v) else to_native(v)) for k, v in row.items()}
+        for row in df.to_dict(orient="records")
+    ]
 
 
 def build_retention_heatmap(cohort_df) -> dict:
@@ -66,10 +92,6 @@ def build_retention_heatmap(cohort_df) -> dict:
             "values": [None if pd_isna(v) else float(v) for v in row["retention_pct"].tolist()],
         })
     return {"cohorts": cohorts, "weeks": [int(w) for w in weeks], "grid": grid}
-
-
-def pd_isna(v):
-    return v != v  # NaN check without importing pandas here
 
 
 def build_funnel(funnel_df) -> dict:
@@ -89,8 +111,47 @@ def build_growth(growth_df) -> dict:
         "new_users": [int(v) for v in growth_df["new_users"].tolist()],
         "returning_users": [int(v) for v in growth_df["returning_users"].tolist()],
         "resurrected_users": [int(v) for v in growth_df["resurrected_users"].tolist()],
+        "churned_users": [int(v) for v in growth_df["churned_users"].tolist()],
         "quick_ratio": [None if pd_isna(v) else float(v) for v in growth_df["quick_ratio"].tolist()],
     }
+
+
+def build_dau_series(dwm_df) -> dict:
+    dwm_df = dwm_df.copy()
+    dwm_df["activity_date"] = dwm_df["activity_date"].astype(str)
+    return {
+        "dates": dwm_df["activity_date"].tolist(),
+        "dau": [int(v) for v in dwm_df["dau"].tolist()],
+        "wau": [int(v) for v in dwm_df["wau"].tolist()],
+        "mau": [int(v) for v in dwm_df["mau"].tolist()],
+        "stickiness": [None if pd_isna(v) else float(v) for v in dwm_df["stickiness_dau_mau"].tolist()],
+    }
+
+
+def build_experiment(result: dict) -> dict:
+    out = {
+        "name": result["name"],
+        "primary_metric": result["primary_metric"],
+        "primary": result["primary"],
+        "guardrail_metric": result["guardrail_metric"],
+        "guardrail": result["guardrail"],
+        "guardrail_ok": result["guardrail_ok"],
+        "required_n_per_arm": result["required_n_per_arm"],
+        "decision": result["decision"],
+        "segment_results": [
+            {"segment": s["segment"], "result": s["result"]}
+            for s in result.get("segment_results", [])
+        ],
+    }
+    if "cuped" in result:
+        out["cuped_variance_reduction_pct"] = result["cuped"]["var_reduction_pct"]
+    if "sequential_peeks" in result:
+        out["sequential_peeks"] = result["sequential_peeks"]
+    if "sequential_alphas" in result:
+        out["sequential_alphas"] = result["sequential_alphas"]
+    if "cohens_d" in result:
+        out["cohens_d"] = result["cohens_d"]
+    return to_native(out)
 
 
 def main():
@@ -102,14 +163,28 @@ def main():
     dwm = dau_wau_mau()
     sstats = session_stats()
 
-    print("Loading retention cohort matrix...")
+    print("Loading retention metrics...")
     cohort = cohort_retention_matrix()
+    day_n = day_n_retention()
+    rolling = rolling_28d_retention()
+    seg_retention = segment_retention()
 
     print("Loading funnel...")
     funnel = funnel_overview()
+    funnel_channel = funnel_by_channel()
 
     print("Loading growth...")
     growth = weekly_growth()
+
+    print("Loading content/widget performance...")
+    widgets = widget_performance().head(15)
+    content_by_type = engagement_by_type_and_category()
+
+    print("Running feed personalization experiment analysis...")
+    feed_experiment = analyze_feed_experiment()
+
+    print("Running onboarding experiment analysis...")
+    onboarding_experiment = analyze_onboarding_experiment()
 
     print("Running push notification experiment analysis (~1-2 min)...")
     push_experiment = analyze_push_experiment()
@@ -126,19 +201,30 @@ def main():
             "avg_stickiness_30d": round(float(dwm.iloc[:-1]["stickiness_dau_mau"].tail(30).mean()), 3),
             "median_sessions_per_user": float(sstats["median_sessions_per_user"].iloc[0]),
         },
-        "retention": build_retention_heatmap(cohort),
-        "funnel": build_funnel(funnel),
+        "engagement": {
+            "dau_series": build_dau_series(dwm),
+            "session_stats": to_native(sstats.iloc[0].to_dict()),
+        },
+        "retention": {
+            "heatmap": build_retention_heatmap(cohort),
+            "day_n": df_records(day_n),
+            "rolling_28d": df_records(rolling.assign(cohort_week=rolling["cohort_week"].astype(str))),
+            "by_segment": df_records(seg_retention),
+        },
+        "funnel": {
+            "overall": build_funnel(funnel),
+            "by_channel": df_records(funnel_channel),
+        },
         "growth": build_growth(growth),
-        "experiment": to_native({
-            "name": push_experiment["name"],
-            "primary_metric": push_experiment["primary_metric"],
-            "primary": push_experiment["primary"],
-            "decision": push_experiment["decision"],
-            "guardrail_ok": push_experiment["guardrail_ok"],
-            "cuped_variance_reduction_pct": push_experiment["cuped"]["var_reduction_pct"],
-            "sequential_peeks": push_experiment["sequential_peeks"],
-            "sequential_alphas": push_experiment["sequential_alphas"],
-        }),
+        "content": {
+            "top_widgets": df_records(widgets),
+            "by_type_category": df_records(content_by_type),
+        },
+        "experiments": {
+            "feed": build_experiment(feed_experiment),
+            "onboarding": build_experiment(onboarding_experiment),
+            "push": build_experiment(push_experiment),
+        },
         "recommendation_eval": recommendation_eval,
     }
 

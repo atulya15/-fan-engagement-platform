@@ -39,3 +39,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local editor/agent tooling -- not part of the application. launch.json
+# in particular pins an absolute machine-specific node.exe path for the
+# Preview MCP tool and would break for anyone else.
+.claude/
+.cursor/

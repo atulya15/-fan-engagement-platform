@@ -19,6 +19,7 @@ export function GrowthChartView({ growth }: { growth: Growth }) {
     new_users: growth.new_users[i],
     returning_users: growth.returning_users[i],
     resurrected_users: growth.resurrected_users[i],
+    churned_users: growth.churned_users[i],
     quick_ratio: growth.quick_ratio[i],
   }));
 
@@ -78,6 +79,15 @@ export function GrowthChartView({ growth }: { growth: Growth }) {
             stackId="a"
             fill="#3fb950"
             radius={[2, 2, 0, 0]}
+          />
+          <Line
+            yAxisId="left"
+            type="monotone"
+            dataKey="churned_users"
+            stroke="#f47174"
+            strokeWidth={1.5}
+            strokeDasharray="3 3"
+            dot={false}
           />
           <ReferenceLine
             yAxisId="right"
